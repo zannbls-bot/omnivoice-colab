@@ -283,8 +283,11 @@ def _separate(data):
     with gpu_lock:
         if not _sep:
             from audio_separator.separator import Separator
+            # overlap 4 (default 8) + batch 4 + autocast: about 3x faster on a T4, still clean enough for ASR and clone references
             s = Separator(output_dir=SEP_OUT, output_format="FLAC", output_single_stem="Vocals",
-                          model_file_dir="/content/sep_models")
+                          model_file_dir="/content/sep_models", use_autocast=True,
+                          mdxc_params={"segment_size": 256, "override_model_segment_size": False, "batch_size": 4,
+                                       "overlap": 4, "pitch_shift": 0})
             s.load_model(SEP_MODEL)
             _sep.append(s)
         shutil.rmtree(SEP_OUT, ignore_errors=True)
