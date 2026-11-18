@@ -15,7 +15,7 @@ POST /embed JSON {audios_b64: [...]} -> {"emb": [[...], ...]}   (WavLM speaker v
 GET /health -> {"ok": true, "gpu": ..., "sr": ...}
 
 Env: OV_KEY (required), OV_PORT (8000), VOX_MODEL (openbmb/VoxCPM2), VOX_OPTIMIZE (1 = torch.compile),
-     VOX_DTYPE (override the checkpoint's bfloat16, e.g. float16/float32 on GPUs without bf16).
+     VOX_DTYPE (override the checkpoint's bfloat16; default float16 on GPUs older than Ampere, e.g. T4).
 """
 import base64
 import io
@@ -31,6 +31,9 @@ from pydantic import BaseModel
 import voxcpm.model.voxcpm2 as _v2
 from voxcpm import VoxCPM
 
+if not os.environ.get("VOX_DTYPE") and torch.cuda.get_device_capability(0)[0] < 8:
+    # T4/V100 have no native bfloat16: the checkpoint's bf16 runs emulated (~4x slower) and torch.compile skips it
+    os.environ["VOX_DTYPE"] = "float16"
 if os.environ.get("VOX_DTYPE"):
     _v2.pick_runtime_dtype = lambda device, dtype: os.environ["VOX_DTYPE"]
 
@@ -79,7 +82,8 @@ def _tmp(b64, files):
 
 @app.get("/health")
 def health():
-    return {"ok": True, "gpu": torch.cuda.get_device_name(0), "sr": SR, "engine": "voxcpm2"}
+    return {"ok": True, "gpu": torch.cuda.get_device_name(0), "sr": SR, "engine": "voxcpm2",
+            "dtype": model.tts_model.config.dtype}
 
 
 @app.post("/tts")
