@@ -91,13 +91,15 @@ def tts(req: TTS, x_api_key: str = Header(None)):
         raise HTTPException(400, "prompt_audio_b64 and prompt_text go together")
     files = []
     try:
-        kw = dict(text=req.text.strip(), cfg_value=req.cfg, inference_timesteps=req.steps, seed=req.seed,
+        kw = dict(text=req.text.strip(), cfg_value=req.cfg, inference_timesteps=req.steps,
                   retry_badcase=req.retry_badcase)
         if req.ref_audio_b64:
             kw["reference_wav_path"] = _tmp(req.ref_audio_b64, files)
         if req.prompt_audio_b64:
             kw["prompt_wav_path"], kw["prompt_text"] = _tmp(req.prompt_audio_b64, files), req.prompt_text
         with gpu_lock:
+            if req.seed is not None:      # PyPI voxcpm 2.0.3 has no seed= argument: seed the global RNGs instead
+                torch.manual_seed(req.seed)
             wav = model.generate(**kw)
     finally:
         for p in files:
