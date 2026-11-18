@@ -19,7 +19,8 @@ POST /separate -> FLAC vocals (BS-Roformer model_bs_roformer_ep_317_sdr_12.9755,
 POST /dnr      -> FLAC effects stem, 44.1 kHz stereo (Bandit-Plus DnR via MSST; music and speech dropped)
 POST /whisper?language=zh&vad=1&beam=5&words=1 -> {"duration", "segments": [{start, end, text, words: [[s, e, w, p]]}]}
                (faster-whisper large-v3, same call Dub Studio makes locally)
-GET /health -> {"ok": true, "gpu": ..., "sr": ...}
+GET /health -> {"ok": true, "gpu": ..., "sr": ..., "idle": seconds since the last job, "up": uptime}
+            (?keep=1 counts as a job: the caller still needs the server; the notebook watchdog frees the runtime after a long idle)
 
 Env: OV_KEY (required), OV_PORT (8000), VOX_MODEL (openbmb/VoxCPM2), VOX_OPTIMIZE (1 = torch.compile),
      VOX_DTYPE (override the checkpoint's bfloat16; default float16 on GPUs older than Ampere, e.g. T4).
@@ -55,6 +56,7 @@ import json
 import os
 import tempfile
 import threading
+import time
 
 import soundfile as sf
 import torch
@@ -113,10 +115,21 @@ def _tmp(b64, files):
     return f.name
 
 
+_t0 = time.time()
+_last_job = [time.time()]      # last real request (or /health?keep=1): the notebook releases the runtime after a long idle
+
+
+@app.middleware("http")
+async def _touch(request, call_next):
+    if request.url.path != "/health" or request.query_params.get("keep"):
+        _last_job[0] = time.time()
+    return await call_next(request)
+
+
 @app.get("/health")
 def health():
     return {"ok": True, "gpu": torch.cuda.get_device_name(0), "sr": SR, "engine": "voxcpm2",
-            "dtype": model.tts_model.config.dtype}
+            "dtype": model.tts_model.config.dtype, "idle": int(time.time() - _last_job[0]), "up": int(time.time() - _t0)}
 
 
 @app.post("/tts")
