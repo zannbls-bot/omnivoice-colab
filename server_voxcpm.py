@@ -30,13 +30,16 @@ if "--whisper-worker" in sys.argv:
     # Separate process: CTranslate2 (faster-whisper) is built for CUDA 12, Colab's torch is CUDA 13 — the parent
     # starts this with LD_LIBRARY_PATH on the cu12 pip libs. One JSON request per stdin line, one "@@"+JSON answer.
     import json
+    import soundfile as sf
     from faster_whisper import WhisperModel
     _m = WhisperModel("large-v3", device="cuda", compute_type="float16")
     print("@@" + json.dumps({"ready": True}), flush=True)
     for _line in sys.stdin:
         _q = json.loads(_line)
         try:
-            _segs, _info = _m.transcribe(_q["path"], language=_q["language"] or None, vad_filter=_q["vad"],
+            # array, not path: faster-whisper's own decoder (PyAV) breaks on Colab's newer PyAV
+            _segs, _info = _m.transcribe(sf.read(_q["path"], dtype="float32")[0], language=_q["language"] or None,
+                                         vad_filter=_q["vad"],
                                          beam_size=_q["beam"], word_timestamps=_q["words"])
             _out = {"duration": _info.duration, "segments": [
                 {"start": s.start, "end": s.end, "text": s.text,
