@@ -24,8 +24,31 @@ GET /health -> {"ok": true, "gpu": ..., "sr": ...}
 Env: OV_KEY (required), OV_PORT (8000), VOX_MODEL (openbmb/VoxCPM2), VOX_OPTIMIZE (1 = torch.compile),
      VOX_DTYPE (override the checkpoint's bfloat16; default float16 on GPUs older than Ampere, e.g. T4).
 """
+import sys
+
+if "--whisper-worker" in sys.argv:
+    # Separate process: CTranslate2 (faster-whisper) is built for CUDA 12, Colab's torch is CUDA 13 — the parent
+    # starts this with LD_LIBRARY_PATH on the cu12 pip libs. One JSON request per stdin line, one "@@"+JSON answer.
+    import json
+    from faster_whisper import WhisperModel
+    _m = WhisperModel("large-v3", device="cuda", compute_type="float16")
+    print("@@" + json.dumps({"ready": True}), flush=True)
+    for _line in sys.stdin:
+        _q = json.loads(_line)
+        try:
+            _segs, _info = _m.transcribe(_q["path"], language=_q["language"] or None, vad_filter=_q["vad"],
+                                         beam_size=_q["beam"], word_timestamps=_q["words"])
+            _out = {"duration": _info.duration, "segments": [
+                {"start": s.start, "end": s.end, "text": s.text,
+                 "words": [[w.start, w.end, w.word, w.probability] for w in (s.words or [])]} for s in _segs]}
+        except Exception as e:
+            _out = {"error": repr(e)}
+        print("@@" + json.dumps(_out), flush=True)
+    raise SystemExit
+
 import base64
 import io
+import json
 import os
 import tempfile
 import threading
@@ -282,17 +305,38 @@ def _dnr_effects(data):
     return _flac(out["effects"].T, 44100)
 
 
+def _worker_answer(p):
+    while True:
+        line = p.stdout.readline()
+        if not line:
+            raise HTTPException(500, "whisper worker died - see /content/whisper_worker.log")
+        if line.startswith("@@"):
+            return json.loads(line[2:])
+
+
 def _whisper(data, language, vad, beam, words):
+    import glob
+    import site
+    import subprocess
     y, _ = _read(data, 16000, mono=True)
+    path = "/content/_whisper_in.wav"
     with gpu_lock:
-        if not _fw:
-            from faster_whisper import WhisperModel
-            _fw.append(WhisperModel("large-v3", device="cuda", compute_type="float16"))
-        segs, info = _fw[0].transcribe(y[:, 0], language=language or None, vad_filter=bool(vad),
-                                       beam_size=beam, word_timestamps=bool(words))
-        out = [{"start": s.start, "end": s.end, "text": s.text,
-                "words": [[w.start, w.end, w.word, w.probability] for w in (s.words or [])]} for s in segs]
-    return {"duration": info.duration, "segments": out}
+        if not _fw or _fw[0].poll() is not None:
+            cu12 = [d for sp in site.getsitepackages() for d in glob.glob(os.path.join(sp, "nvidia", "*", "lib"))
+                    if os.sep + "cu13" + os.sep not in d]
+            env = dict(os.environ, LD_LIBRARY_PATH=":".join(cu12 + [os.environ.get("LD_LIBRARY_PATH", "")]))
+            _fw[:] = [subprocess.Popen([sys.executable, "-u", os.path.abspath(__file__), "--whisper-worker"],
+                                       stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True, env=env,
+                                       stderr=open("/content/whisper_worker.log", "a"))]
+            _worker_answer(_fw[0])                       # "ready" (first time: downloads large-v3)
+        sf.write(path, y[:, 0], 16000, subtype="PCM_16")
+        _fw[0].stdin.write(json.dumps({"path": path, "language": language, "vad": bool(vad), "beam": beam,
+                                       "words": bool(words)}) + chr(10))
+        _fw[0].stdin.flush()
+        out = _worker_answer(_fw[0])
+    if "error" in out:
+        raise HTTPException(500, out["error"])
+    return out
 
 
 @app.post("/separate")
