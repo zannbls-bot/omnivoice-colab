@@ -36,6 +36,7 @@ python client.py --url URL --key KEY --instruct "female, low pitch" --text "Hell
 - `POST /tts` JSON `text` (required), `ref_audio_b64` (เสียงต้นแบบ: เอาแค่เนื้อเสียง), `prompt_audio_b64` + `prompt_text` (พูดต่อจากเสียงนี้ — บทต้องตรงกับเสียงเป๊ะ), `cfg` (2.0), `steps` (10), `seed`, `retry_badcase` → `audio/wav` 48 kHz 16-bit
 - `POST /asr` JSON `audio_b64`, `language` → `{"text"}` (Whisper large-v3-turbo — ฟังย้อนตรวจเสียงที่เจน)
 - `POST /embed` JSON `audios_b64: [...]` → `{"emb": [[...]]}` (ลายเสียง WavLM, dot = cosine — คัดต้นแบบคนเดียวกัน/วัดความเหมือน)
+- `POST /judge` JSON `audios_b64: [...]` → `{"scores": [{"mos", "lang": {"th", "zh", "en"}}]}` (หูกลเลือกเทค: UTMOS ความเป็นธรรมชาติ 1–5 + Whisper ตรวจภาษา — เสียงไทยที่ติดสำเนียงจีน ค่า th ต่ำ)
 
 **OmniVoice** (`server.py`)
 - `POST /tts` JSON `text` (required), `ref_audio_b64`, `ref_text`, `instruct`, `language`, `speed`, `duration`, `num_step` (default 32) → `audio/wav` 24 kHz 16-bit. Same reference audio is encoded once per session (cached).

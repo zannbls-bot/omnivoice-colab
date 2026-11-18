@@ -12,6 +12,8 @@ POST /tts   header X-API-Key: <OV_KEY>
 POST /asr   JSON {audio_b64, language?} -> {"text": ...}   (Whisper large-v3-turbo, for back-checking takes)
 POST /embed JSON {audios_b64: [...]} -> {"emb": [[...], ...]}   (WavLM speaker vectors, L2-normalised:
             dot product = cosine similarity; for picking same-speaker references and scoring clones)
+POST /judge JSON {audios_b64: [...], langs?} -> {"scores": [{"mos": 1-5, "lang": {"th": p, "zh": p, ...}}]}
+            (UTMOS naturalness + Whisper language-ID: machine ears for picking the best take)
 GET /health -> {"ok": true, "gpu": ..., "sr": ...}
 
 Env: OV_KEY (required), OV_PORT (8000), VOX_MODEL (openbmb/VoxCPM2), VOX_OPTIMIZE (1 = torch.compile),
@@ -130,6 +132,53 @@ def asr(req: ASR, x_api_key: str = Header(None)):
         for f in files:
             os.remove(f)
     return {"text": out["text"].strip()}
+
+
+class JUDGE(BaseModel):
+    audios_b64: list[str]
+    langs: list[str] = ["th", "zh", "en"]
+
+
+_mos = []                     # lazily loaded UTMOS predictor
+
+
+@app.post("/judge")
+def judge(req: JUDGE, x_api_key: str = Header(None)):
+    """Machine ears for picking takes: UTMOS naturalness (1-5) + Whisper language-ID probabilities
+    (low "th" / high "zh" on a Thai line = foreign accent)."""
+    _auth(x_api_key)
+    import librosa
+    out = []
+    with gpu_lock:
+        if not _mos:
+            _mos.append(torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True).to("cuda:0").eval())
+        if not _asr:
+            from transformers import pipeline
+            _asr.append(pipeline("automatic-speech-recognition", "openai/whisper-large-v3-turbo",
+                                 torch_dtype=torch.float16, device="cuda:0"))
+        asr = _asr[0]
+        tok = asr.tokenizer
+        lang_ids = {code: tok.convert_tokens_to_ids(f"<|{code}|>")
+                    for code in ("en", "zh", "de", "es", "ru", "ko", "fr", "ja", "pt", "tr", "pl", "ca", "nl", "ar",
+                                 "sv", "it", "id", "hi", "fi", "vi", "he", "uk", "el", "ms", "cs", "ro", "da", "hu",
+                                 "ta", "no", "th", "ur", "hr", "bg", "lt", "la", "mi", "ml", "cy", "sk", "te", "fa",
+                                 "lv", "bn", "sr", "az", "sl", "kn", "et", "mk", "br", "eu", "is", "hy", "ne", "mn",
+                                 "bs", "kk", "sq", "sw", "gl", "mr", "pa", "si", "km", "sn", "yo", "so", "af", "oc",
+                                 "ka", "be", "tg", "sd", "gu", "am", "yi", "lo", "uz", "fo", "ht", "ps", "tk", "nn",
+                                 "mt", "sa", "lb", "my", "bo", "tl", "mg", "as", "tt", "haw", "ln", "ha", "ba", "jw",
+                                 "su", "yue")}
+        ids = torch.tensor(list(lang_ids.values()), device="cuda:0")
+        sot = torch.tensor([[tok.convert_tokens_to_ids("<|startoftranscript|>")]], device="cuda:0")
+        for b in req.audios_b64:
+            y, _ = librosa.load(io.BytesIO(base64.b64decode(b)), sr=16000, mono=True)
+            with torch.no_grad():
+                mos = float(_mos[0](torch.from_numpy(y).unsqueeze(0).to("cuda:0"), 16000)[0])
+                feats = asr.feature_extractor(y, sampling_rate=16000, return_tensors="pt").input_features
+                logits = asr.model(input_features=feats.to("cuda:0", torch.float16), decoder_input_ids=sot).logits[0, -1]
+                p = torch.softmax(logits[ids].float(), dim=-1)
+            probs = dict(zip(lang_ids, p.tolist()))
+            out.append({"mos": round(mos, 3), "lang": {k: round(probs.get(k, 0.0), 4) for k in req.langs}})
+    return {"scores": out}
 
 
 @app.post("/embed")
