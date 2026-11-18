@@ -121,17 +121,25 @@ _t0 = time.time()
 _last_job = [time.time()]      # last real request (or /health?keep=1): the notebook releases the runtime after a long idle
 
 
+_now = {"info": "", "t": 0.0}  # what the caller says it is doing (header X-Job-Info), shown by the notebook watchdog
+
+
 @app.middleware("http")
 async def _touch(request, call_next):
     if request.url.path != "/health" or request.query_params.get("keep"):
         _last_job[0] = time.time()
+    info = request.headers.get("x-job-info")
+    if info:
+        import urllib.parse
+        _now.update(info=urllib.parse.unquote(info)[:200], t=time.time())
     return await call_next(request)
 
 
 @app.get("/health")
 def health():
     return {"ok": True, "gpu": torch.cuda.get_device_name(0), "sr": SR, "engine": "voxcpm2",
-            "dtype": model.tts_model.config.dtype, "idle": int(time.time() - _last_job[0]), "up": int(time.time() - _t0)}
+            "dtype": model.tts_model.config.dtype, "idle": int(time.time() - _last_job[0]), "up": int(time.time() - _t0),
+            "now": _now["info"], "now_age": int(time.time() - _now["t"])}
 
 
 @app.post("/tts")
