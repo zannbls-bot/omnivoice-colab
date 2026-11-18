@@ -15,6 +15,8 @@ POST /embed JSON {audios_b64: [...]} -> {"emb": [[...], ...]}   (WavLM speaker v
 POST /judge JSON {audios_b64: [...], langs?} -> {"scores": [{"mos": 1-5, "lang": {"th": p, "zh": p, ...}}]}
             (UTMOS naturalness + Whisper language-ID: machine ears for picking the best take)
 Heavy dub-pipeline jobs for Dub Studio (raw audio bytes in the request body, not JSON):
+  add ?wait=0 to get {"job": id} at once, then GET /job/<id>: 202 = still running, 200 = the result, 404 = server
+  restarted (submit again). Needed behind the Cloudflare tunnel, which cuts requests that take over 100 s (HTTP 524).
 POST /separate -> FLAC vocals (BS-Roformer model_bs_roformer_ep_317_sdr_12.9755, via audio-separator)
 POST /dnr      -> FLAC effects stem, 44.1 kHz stereo (Bandit-Plus DnR via MSST; music and speech dropped)
 POST /whisper?language=zh&vad=1&beam=5&words=1 -> {"duration", "segments": [{start, end, text, words: [[s, e, w, p]]}]}
@@ -355,23 +357,68 @@ def _whisper(data, language, vad, beam, words):
     return out
 
 
-@app.post("/separate")
-async def separate(request: Request, x_api_key: str = Header(None)):
+# Cloudflare quick tunnels cut any request that takes longer than 100 s to answer (HTTP 524), so heavy jobs are
+# submitted with ?wait=0 (returns {"job": id} at once) and fetched from GET /job/<id> (202 while running).
+_jobs = {}
+
+
+def _start(fn, *a, ctype="application/json"):
+    jid = base64.urlsafe_b64encode(os.urandom(9)).decode()
+    _jobs[jid] = j = {"t": time.time(), "done": 0.0, "out": None, "err": None, "ctype": ctype}
+
+    def run():
+        try:
+            j["out"] = fn(*a)
+        except HTTPException as e:
+            j["err"] = str(e.detail)
+        except Exception as e:
+            j["err"] = repr(e)
+        j["done"] = time.time()
+    threading.Thread(target=run, daemon=True).start()
+    for k in [k for k, v in _jobs.items() if v["done"] and time.time() - v["done"] > 600]:   # fetched or forgotten results
+        _jobs.pop(k, None)
+    return {"job": jid}
+
+
+@app.get("/job/{jid}")
+def job(jid: str, x_api_key: str = Header(None)):
     _auth(x_api_key)
-    return Response(await run_in_threadpool(_separate, await request.body()), media_type="audio/flac")
+    j = _jobs.get(jid)
+    if j is None:
+        raise HTTPException(404, "no such job (server restarted?) - submit it again")
+    if not j["done"]:
+        return Response(status_code=202)
+    if j["err"]:
+        raise HTTPException(500, j["err"])
+    return Response(j["out"], media_type=j["ctype"]) if isinstance(j["out"], bytes) else j["out"]
+
+
+@app.post("/separate")
+async def separate(request: Request, wait: int = 1, x_api_key: str = Header(None)):
+    _auth(x_api_key)
+    data = await request.body()
+    if not wait:
+        return _start(_separate, data, ctype="audio/flac")
+    return Response(await run_in_threadpool(_separate, data), media_type="audio/flac")
 
 
 @app.post("/dnr")
-async def dnr(request: Request, x_api_key: str = Header(None)):
+async def dnr(request: Request, wait: int = 1, x_api_key: str = Header(None)):
     _auth(x_api_key)
-    return Response(await run_in_threadpool(_dnr_effects, await request.body()), media_type="audio/flac")
+    data = await request.body()
+    if not wait:
+        return _start(_dnr_effects, data, ctype="audio/flac")
+    return Response(await run_in_threadpool(_dnr_effects, data), media_type="audio/flac")
 
 
 @app.post("/whisper")
-async def whisper(request: Request, language: str = "zh", vad: int = 1, beam: int = 5, words: int = 1,
+async def whisper(request: Request, language: str = "zh", vad: int = 1, beam: int = 5, words: int = 1, wait: int = 1,
                   x_api_key: str = Header(None)):
     _auth(x_api_key)
-    return await run_in_threadpool(_whisper, await request.body(), language, vad, beam, words)
+    data = await request.body()
+    if not wait:
+        return _start(_whisper, data, language, vad, beam, words)
+    return await run_in_threadpool(_whisper, data, language, vad, beam, words)
 
 
 if __name__ == "__main__":
