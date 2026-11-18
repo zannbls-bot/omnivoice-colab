@@ -181,7 +181,7 @@ def asr(req: ASR, x_api_key: str = Header(None)):
                 _asr.append(pipeline("automatic-speech-recognition", "openai/whisper-large-v3-turbo",
                                      torch_dtype=torch.float16, device="cuda:0"))
             gk = {"language": req.language, "task": "transcribe"} if req.language else {"task": "transcribe"}
-            out = _asr[0](p, generate_kwargs=gk)
+            out = _asr[0](p, generate_kwargs=gk, return_timestamps=True)    # needed for audio over 30 s (else ValueError -> 500)
     finally:
         for f in files:
             os.remove(f)
