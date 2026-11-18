@@ -14,6 +14,11 @@ POST /embed JSON {audios_b64: [...]} -> {"emb": [[...], ...]}   (WavLM speaker v
             dot product = cosine similarity; for picking same-speaker references and scoring clones)
 POST /judge JSON {audios_b64: [...], langs?} -> {"scores": [{"mos": 1-5, "lang": {"th": p, "zh": p, ...}}]}
             (UTMOS naturalness + Whisper language-ID: machine ears for picking the best take)
+Heavy dub-pipeline jobs for Dub Studio (raw audio bytes in the request body, not JSON):
+POST /separate -> FLAC vocals (BS-Roformer model_bs_roformer_ep_317_sdr_12.9755, via audio-separator)
+POST /dnr      -> FLAC effects stem, 44.1 kHz stereo (Bandit-Plus DnR via MSST; music and speech dropped)
+POST /whisper?language=zh&vad=1&beam=5&words=1 -> {"duration", "segments": [{start, end, text, words: [[s, e, w, p]]}]}
+               (faster-whisper large-v3, same call Dub Studio makes locally)
 GET /health -> {"ok": true, "gpu": ..., "sr": ...}
 
 Env: OV_KEY (required), OV_PORT (8000), VOX_MODEL (openbmb/VoxCPM2), VOX_OPTIMIZE (1 = torch.compile),
@@ -199,6 +204,114 @@ def embed(req: EMB, x_api_key: str = Header(None)):
                 e = m(**x).embeddings[0]
             out.append(torch.nn.functional.normalize(e, dim=-1).tolist())
     return {"emb": out}
+
+
+# ---------------------------------------------------------------- dub-pipeline jobs (raw bytes in, raw bytes out)
+from fastapi import Request
+from starlette.concurrency import run_in_threadpool
+
+MSST_DIR = os.environ.get("MSST_DIR", "/content/MSST")
+DNR_CKPT = os.path.join(MSST_DIR, "model_bandit_plus_dnr_sdr_11.47.chpt")
+DNR_CFG = os.path.join(MSST_DIR, "configs", "config_dnr_bandit_bsrnn_multi_mus64.yaml")
+SEP_MODEL = "model_bs_roformer_ep_317_sdr_12.9755.ckpt"
+SEP_OUT = "/content/sep_out"
+_sep, _dnr, _fw = [], [], []
+
+
+def _flac(y, sr):
+    buf = io.BytesIO()
+    sf.write(buf, y, sr, format="FLAC", subtype="PCM_24")
+    return buf.getvalue()
+
+
+def _read(data, sr=None, mono=False):
+    """audio bytes -> float32 (samples, channels) at sr (None = keep)"""
+    import librosa
+    y, r = sf.read(io.BytesIO(data), dtype="float32", always_2d=True)
+    if mono:
+        y = y.mean(axis=1, keepdims=True)
+    if sr and r != sr:
+        y = librosa.resample(y.T, orig_sr=r, target_sr=sr).T
+        r = sr
+    return y, r
+
+
+def _separate(data):
+    import glob
+    import shutil
+    with gpu_lock:
+        if not _sep:
+            from audio_separator.separator import Separator
+            s = Separator(output_dir=SEP_OUT, output_format="FLAC", output_single_stem="Vocals",
+                          model_file_dir="/content/sep_models")
+            s.load_model(SEP_MODEL)
+            _sep.append(s)
+        shutil.rmtree(SEP_OUT, ignore_errors=True)
+        os.makedirs(SEP_OUT, exist_ok=True)
+        src = os.path.join(SEP_OUT, "in.flac")
+        with open(src, "wb") as f:
+            f.write(data)
+        _sep[0].separate(src)
+        torch.cuda.empty_cache()
+    voc = [p for p in glob.glob(os.path.join(SEP_OUT, "*")) if "vocals" in os.path.basename(p).lower()]
+    if not voc:
+        raise HTTPException(500, f"no vocals stem: {os.listdir(SEP_OUT)}")
+    with open(voc[0], "rb") as f:
+        return f.read()
+
+
+def _dnr_effects(data):
+    import numpy as np
+    y, _ = _read(data, 44100)
+    mix = y.T                                   # (channels, samples)
+    if mix.shape[0] == 1:
+        mix = np.concatenate([mix, mix])
+    with gpu_lock:
+        if not _dnr:
+            import sys
+            sys.path.insert(0, MSST_DIR)
+            from utils.settings import get_model_from_config
+            m, cfg = get_model_from_config("bandit", DNR_CFG)
+            sd = torch.load(DNR_CKPT, map_location="cpu", weights_only=False)
+            m.load_state_dict(sd["state_dict"] if "state_dict" in sd else sd)
+            _dnr.extend([m.to("cuda:0").eval(), cfg])
+        from utils.model_utils import demix
+        with torch.no_grad():
+            out = demix(_dnr[1], _dnr[0], mix, torch.device("cuda:0"), model_type="bandit")
+        torch.cuda.empty_cache()
+    return _flac(out["effects"].T, 44100)
+
+
+def _whisper(data, language, vad, beam, words):
+    y, _ = _read(data, 16000, mono=True)
+    with gpu_lock:
+        if not _fw:
+            from faster_whisper import WhisperModel
+            _fw.append(WhisperModel("large-v3", device="cuda", compute_type="float16"))
+        segs, info = _fw[0].transcribe(y[:, 0], language=language or None, vad_filter=bool(vad),
+                                       beam_size=beam, word_timestamps=bool(words))
+        out = [{"start": s.start, "end": s.end, "text": s.text,
+                "words": [[w.start, w.end, w.word, w.probability] for w in (s.words or [])]} for s in segs]
+    return {"duration": info.duration, "segments": out}
+
+
+@app.post("/separate")
+async def separate(request: Request, x_api_key: str = Header(None)):
+    _auth(x_api_key)
+    return Response(await run_in_threadpool(_separate, await request.body()), media_type="audio/flac")
+
+
+@app.post("/dnr")
+async def dnr(request: Request, x_api_key: str = Header(None)):
+    _auth(x_api_key)
+    return Response(await run_in_threadpool(_dnr_effects, await request.body()), media_type="audio/flac")
+
+
+@app.post("/whisper")
+async def whisper(request: Request, language: str = "zh", vad: int = 1, beam: int = 5, words: int = 1,
+                  x_api_key: str = Header(None)):
+    _auth(x_api_key)
+    return await run_in_threadpool(_whisper, await request.body(), language, vad, beam, words)
 
 
 if __name__ == "__main__":

@@ -37,6 +37,9 @@ python client.py --url URL --key KEY --instruct "female, low pitch" --text "Hell
 - `POST /asr` JSON `audio_b64`, `language` → `{"text"}` (Whisper large-v3-turbo — ฟังย้อนตรวจเสียงที่เจน)
 - `POST /embed` JSON `audios_b64: [...]` → `{"emb": [[...]]}` (ลายเสียง WavLM, dot = cosine — คัดต้นแบบคนเดียวกัน/วัดความเหมือน)
 - `POST /judge` JSON `audios_b64: [...]` → `{"scores": [{"mos", "lang": {"th", "zh", "en"}}]}` (หูกลเลือกเทค: UTMOS ความเป็นธรรมชาติ 1–5 + Whisper ตรวจภาษา — เสียงไทยที่ติดสำเนียงจีน ค่า th ต่ำ)
+- งานหนักของ Dub Studio V4 (ส่งไฟล์เสียงดิบใน body ไม่ห่อ JSON · ใช้ช่อง 1b ติดตั้งให้):
+  `POST /separate` → FLAC เสียงพูด (BS-Roformer) · `POST /dnr` → FLAC เสียงเอฟเฟกต์ 44.1 kHz (Bandit-Plus DnR ทิ้งเพลง/เสียงพูด) ·
+  `POST /whisper?language=zh&vad=1&beam=5&words=1` → `{"duration", "segments"}` (faster-whisper large-v3)
 
 **OmniVoice** (`server.py`)
 - `POST /tts` JSON `text` (required), `ref_audio_b64`, `ref_text`, `instruct`, `language`, `speed`, `duration`, `num_step` (default 32) → `audio/wav` 24 kHz 16-bit. Same reference audio is encoded once per session (cached).
