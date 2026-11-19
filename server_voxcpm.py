@@ -142,9 +142,13 @@ def health():
             "now": _now["info"], "now_age": int(time.time() - _now["t"])}
 
 
+# ?wait=0 on these four as well (returns {"job": id}; result from GET /job/<id>): a short request can sit behind a long
+# separation or effects job on the single GPU for more than the tunnel's 100 s and be cut with HTTP 524.
 @app.post("/tts")
-def tts(req: TTS, x_api_key: str = Header(None)):
+def tts(req: TTS, wait: int = 1, x_api_key: str = Header(None)):
     _auth(x_api_key)
+    if not wait:
+        return _start(tts, req, 1, x_api_key)
     if not req.text.strip():
         raise HTTPException(400, "empty text")
     if bool(req.prompt_audio_b64) != bool(req.prompt_text):
@@ -170,8 +174,10 @@ def tts(req: TTS, x_api_key: str = Header(None)):
 
 
 @app.post("/asr")
-def asr(req: ASR, x_api_key: str = Header(None)):
+def asr(req: ASR, wait: int = 1, x_api_key: str = Header(None)):
     _auth(x_api_key)
+    if not wait:
+        return _start(asr, req, 1, x_api_key)
     files = []
     try:
         p = _tmp(req.audio_b64, files)
@@ -197,10 +203,12 @@ _mos = []                     # lazily loaded UTMOS predictor
 
 
 @app.post("/judge")
-def judge(req: JUDGE, x_api_key: str = Header(None)):
+def judge(req: JUDGE, wait: int = 1, x_api_key: str = Header(None)):
     """Machine ears for picking takes: UTMOS naturalness (1-5) + Whisper language-ID probabilities
     (low "th" / high "zh" on a Thai line = foreign accent)."""
     _auth(x_api_key)
+    if not wait:
+        return _start(judge, req, 1, x_api_key)
     import librosa
     out = []
     with gpu_lock:
@@ -236,8 +244,10 @@ def judge(req: JUDGE, x_api_key: str = Header(None)):
 
 
 @app.post("/embed")
-def embed(req: EMB, x_api_key: str = Header(None)):
+def embed(req: EMB, wait: int = 1, x_api_key: str = Header(None)):
     _auth(x_api_key)
+    if not wait:
+        return _start(embed, req, 1, x_api_key)
     import librosa
     out = []
     with gpu_lock:
