@@ -79,6 +79,36 @@ model = VoxCPM.from_pretrained(os.environ.get("VOX_MODEL", "openbmb/VoxCPM2"), l
                                optimize=os.environ.get("VOX_OPTIMIZE", "1") == "1")
 SR = model.tts_model.sample_rate
 gpu_lock = threading.Lock()   # one job at a time on the single GPU
+
+# Voice-clone requests (tts / asr / embed / judge) are short and come one after another, several per line. Queued
+# behind separation or effects jobs (60-90 s each) every one of them waited a whole long job: 0 lines in 14 minutes
+# on a real 2-hour clip. So short requests go first, and a long job only starts once no short request has been seen
+# for SHORT_GRACE seconds - the long jobs fill the gaps while the clone stage is idle. Nothing is lost: the GPU never
+# sits idle while work is waiting for longer than the grace period.
+SHORT_GRACE = 8.0
+_short = {"n": 0, "last": 0.0}
+_short_guard = threading.Lock()
+
+
+class _short_gpu:
+    def __enter__(self):
+        with _short_guard:
+            _short["n"] += 1
+        gpu_lock.acquire()
+
+    def __exit__(self, *exc):
+        gpu_lock.release()
+        with _short_guard:
+            _short["n"] -= 1
+            _short["last"] = time.time()
+
+
+def _long_gate():
+    """long jobs call this before taking gpu_lock"""
+    while _short["n"] or time.time() - _short["last"] < SHORT_GRACE:
+        time.sleep(0.25)
+
+
 _asr = []                     # lazily loaded Whisper pipeline
 _sv = []                      # lazily loaded speaker-vector model
 
@@ -161,7 +191,7 @@ def tts(req: TTS, wait: int = 1, x_api_key: str = Header(None)):
             kw["reference_wav_path"] = _tmp(req.ref_audio_b64, files)
         if req.prompt_audio_b64:
             kw["prompt_wav_path"], kw["prompt_text"] = _tmp(req.prompt_audio_b64, files), req.prompt_text
-        with gpu_lock:
+        with _short_gpu():
             if req.seed is not None:      # PyPI voxcpm 2.0.3 has no seed= argument: seed the global RNGs instead
                 torch.manual_seed(req.seed)
             wav = model.generate(**kw)
@@ -181,7 +211,7 @@ def asr(req: ASR, wait: int = 1, x_api_key: str = Header(None)):
     files = []
     try:
         p = _tmp(req.audio_b64, files)
-        with gpu_lock:
+        with _short_gpu():
             if not _asr:
                 from transformers import pipeline
                 _asr.append(pipeline("automatic-speech-recognition", "openai/whisper-large-v3-turbo",
@@ -211,7 +241,7 @@ def judge(req: JUDGE, wait: int = 1, x_api_key: str = Header(None)):
         return _start(judge, req, 1, x_api_key)
     import librosa
     out = []
-    with gpu_lock:
+    with _short_gpu():
         if not _mos:
             _mos.append(torch.hub.load("tarepan/SpeechMOS:v1.2.0", "utmos22_strong", trust_repo=True).to("cuda:0").eval())
         if not _asr:
@@ -250,7 +280,7 @@ def embed(req: EMB, wait: int = 1, x_api_key: str = Header(None)):
         return _start(embed, req, 1, x_api_key)
     import librosa
     out = []
-    with gpu_lock:
+    with _short_gpu():
         if not _sv:
             from transformers import AutoFeatureExtractor, WavLMForXVector
             _sv.append(AutoFeatureExtractor.from_pretrained("microsoft/wavlm-base-plus-sv"))
@@ -298,6 +328,7 @@ def _read(data, sr=None, mono=False):
 def _separate(data, sr=0, mono=0):
     import glob
     import shutil
+    _long_gate()
     with gpu_lock:
         if not _sep:
             from audio_separator.separator import Separator
@@ -331,6 +362,7 @@ def _dnr_effects(data):
     mix = y.T                                   # (channels, samples)
     if mix.shape[0] == 1:
         mix = np.concatenate([mix, mix])
+    _long_gate()
     with gpu_lock:
         if not _dnr:
             import sys
@@ -362,6 +394,7 @@ def _whisper(data, language, vad, beam, words):
     import subprocess
     y, _ = _read(data, 16000, mono=True)
     path = "/content/_whisper_in.wav"
+    _long_gate()
     with gpu_lock:
         if not _fw or _fw[0].poll() is not None:
             cu12 = [d for sp in site.getsitepackages() for d in glob.glob(os.path.join(sp, "nvidia", "*", "lib"))
