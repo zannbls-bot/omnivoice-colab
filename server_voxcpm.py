@@ -175,10 +175,10 @@ def health():
 # ?wait=0 on these four as well (returns {"job": id}; result from GET /job/<id>): a short request can sit behind a long
 # separation or effects job on the single GPU for more than the tunnel's 100 s and be cut with HTTP 524.
 @app.post("/tts")
-def tts(req: TTS, wait: int = 1, x_api_key: str = Header(None)):
+def tts(req: TTS, wait: int = 1, hold: int = 0, x_api_key: str = Header(None)):
     _auth(x_api_key)
     if not wait:
-        return _start(tts, req, 1, x_api_key)
+        return _start(tts, req, 1, 0, x_api_key, hold=hold)
     if not req.text.strip():
         raise HTTPException(400, "empty text")
     if bool(req.prompt_audio_b64) != bool(req.prompt_text):
@@ -204,10 +204,10 @@ def tts(req: TTS, wait: int = 1, x_api_key: str = Header(None)):
 
 
 @app.post("/asr")
-def asr(req: ASR, wait: int = 1, x_api_key: str = Header(None)):
+def asr(req: ASR, wait: int = 1, hold: int = 0, x_api_key: str = Header(None)):
     _auth(x_api_key)
     if not wait:
-        return _start(asr, req, 1, x_api_key)
+        return _start(asr, req, 1, 0, x_api_key, hold=hold)
     files = []
     try:
         p = _tmp(req.audio_b64, files)
@@ -233,12 +233,12 @@ _mos = []                     # lazily loaded UTMOS predictor
 
 
 @app.post("/judge")
-def judge(req: JUDGE, wait: int = 1, x_api_key: str = Header(None)):
+def judge(req: JUDGE, wait: int = 1, hold: int = 0, x_api_key: str = Header(None)):
     """Machine ears for picking takes: UTMOS naturalness (1-5) + Whisper language-ID probabilities
     (low "th" / high "zh" on a Thai line = foreign accent)."""
     _auth(x_api_key)
     if not wait:
-        return _start(judge, req, 1, x_api_key)
+        return _start(judge, req, 1, 0, x_api_key, hold=hold)
     import librosa
     out = []
     with _short_gpu():
@@ -274,10 +274,10 @@ def judge(req: JUDGE, wait: int = 1, x_api_key: str = Header(None)):
 
 
 @app.post("/embed")
-def embed(req: EMB, wait: int = 1, x_api_key: str = Header(None)):
+def embed(req: EMB, wait: int = 1, hold: int = 0, x_api_key: str = Header(None)):
     _auth(x_api_key)
     if not wait:
-        return _start(embed, req, 1, x_api_key)
+        return _start(embed, req, 1, 0, x_api_key, hold=hold)
     import librosa
     out = []
     with _short_gpu():
@@ -419,9 +419,17 @@ def _whisper(data, language, vad, beam, words):
 _jobs = {}
 
 
-def _start(fn, *a, ctype="application/json"):
+def _result(j):
+    if j["err"]:
+        raise HTTPException(500, j["err"])
+    return Response(j["out"], media_type=j["ctype"]) if isinstance(j["out"], bytes) else j["out"]
+
+
+def _start(fn, *a, ctype="application/json", hold=0):
+    """hold > 0: wait up to that many seconds (60 at most, well under the tunnel's 100) and answer with the result
+    itself when the job finishes in time - a short clone request then costs one round trip, not submit + polls."""
     jid = base64.urlsafe_b64encode(os.urandom(9)).decode()
-    _jobs[jid] = j = {"t": time.time(), "done": 0.0, "out": None, "err": None, "ctype": ctype}
+    _jobs[jid] = j = {"t": time.time(), "done": 0.0, "out": None, "err": None, "ctype": ctype, "ev": threading.Event()}
 
     def run():
         try:
@@ -431,23 +439,27 @@ def _start(fn, *a, ctype="application/json"):
         except Exception as e:
             j["err"] = repr(e)
         j["done"] = time.time()
+        j["ev"].set()
     threading.Thread(target=run, daemon=True).start()
-    for k in [k for k, v in _jobs.items() if v["done"] and time.time() - v["done"] > 600]:   # fetched or forgotten results
+    for k in [k for k, v in list(_jobs.items()) if v["done"] and time.time() - v["done"] > 600]:   # fetched or forgotten results
         _jobs.pop(k, None)
+    if hold > 0 and j["ev"].wait(min(hold, 60)):
+        _jobs.pop(jid, None)
+        return _result(j)
     return {"job": jid}
 
 
 @app.get("/job/{jid}")
-def job(jid: str, x_api_key: str = Header(None)):
+def job(jid: str, hold: int = 0, x_api_key: str = Header(None)):
     _auth(x_api_key)
     j = _jobs.get(jid)
     if j is None:
         raise HTTPException(404, "no such job (server restarted?) - submit it again")
+    if not j["done"] and hold > 0:               # long poll: answer as soon as the job ends instead of making the caller ask again
+        j["ev"].wait(min(hold, 60))
     if not j["done"]:
         return Response(status_code=202)
-    if j["err"]:
-        raise HTTPException(500, j["err"])
-    return Response(j["out"], media_type=j["ctype"]) if isinstance(j["out"], bytes) else j["out"]
+    return _result(j)
 
 
 # The tunnel's 100 s limit includes the time the caller needs to upload the request body: 25 MB of audio over a
