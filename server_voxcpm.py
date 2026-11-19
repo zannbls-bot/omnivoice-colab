@@ -269,7 +269,7 @@ _sep, _dnr, _fw = [], [], []
 
 def _flac(y, sr):
     buf = io.BytesIO()
-    sf.write(buf, y, sr, format="FLAC", subtype="PCM_24")
+    sf.write(buf, y, sr, format="FLAC", subtype="PCM_16")
     return buf.getvalue()
 
 
@@ -285,7 +285,7 @@ def _read(data, sr=None, mono=False):
     return y, r
 
 
-def _separate(data):
+def _separate(data, sr=0, mono=0):
     import glob
     import shutil
     with gpu_lock:
@@ -309,7 +309,10 @@ def _separate(data):
     if not voc:
         raise HTTPException(500, f"no vocals stem: {os.listdir(SEP_OUT)}")
     with open(voc[0], "rb") as f:
-        return f.read()
+        out = f.read()
+    if sr or mono:
+        out = _flac(*_read(out, sr or None, bool(mono)))
+    return out
 
 
 def _dnr_effects(data):
@@ -404,19 +407,63 @@ def job(jid: str, x_api_key: str = Header(None)):
     return Response(j["out"], media_type=j["ctype"]) if isinstance(j["out"], bytes) else j["out"]
 
 
-@app.post("/separate")
-async def separate(request: Request, wait: int = 1, x_api_key: str = Header(None)):
+# The tunnel's 100 s limit includes the time the caller needs to upload the request body: 25 MB of audio over a
+# 1 Mbit/s uplink never makes it (HTTP 524 every time). So a big body is sent first in small parts with
+# POST /put/<id>/<i>, and the job endpoint is then called with ?up=<id>&n=<parts> and an empty body.
+UP_DIR = "/content/_up"
+_UP_ID = __import__("re").compile(r"[0-9a-f]{32}")
+
+
+@app.post("/put/{up}/{i}")
+async def put(up: str, i: int, request: Request, x_api_key: str = Header(None)):
     _auth(x_api_key)
+    if not _UP_ID.fullmatch(up) or not 0 <= i < 4096:
+        raise HTTPException(400, "bad upload id")
+    import shutil
     data = await request.body()
+    d = os.path.join(UP_DIR, up)
+    os.makedirs(d, exist_ok=True)
+    tmp = os.path.join(d, f"{i:05d}.tmp")
+    with open(tmp, "wb") as f:
+        f.write(data)
+    os.replace(tmp, os.path.join(d, f"{i:05d}"))
+    for name in os.listdir(UP_DIR):                      # uploads nobody came back for (kept 1 h so a retried job call still finds them)
+        old = os.path.join(UP_DIR, name)
+        if name != up and time.time() - os.path.getmtime(old) > 3600:
+            shutil.rmtree(old, ignore_errors=True)
+    return {"ok": True, "size": len(data)}
+
+
+def _body(data, up, n):
+    """the request body, or the n parts uploaded earlier under id `up`"""
+    if not up:
+        return data
+    if not _UP_ID.fullmatch(up) or not 0 < n <= 4096:
+        raise HTTPException(400, "bad upload id")
+    parts = [os.path.join(UP_DIR, up, f"{i:05d}") for i in range(n)]
+    if not all(os.path.exists(p) for p in parts):
+        raise HTTPException(409, "upload incomplete (server restarted?) - send the parts again")
+    out = bytearray()
+    for p in parts:
+        with open(p, "rb") as f:
+            out += f.read()
+    return bytes(out)
+
+
+@app.post("/separate")
+async def separate(request: Request, wait: int = 1, up: str = "", n: int = 0, sr: int = 0, mono: int = 0,
+                   x_api_key: str = Header(None)):
+    _auth(x_api_key)
+    data = _body(await request.body(), up, n)
     if not wait:
-        return _start(_separate, data, ctype="audio/flac")
-    return Response(await run_in_threadpool(_separate, data), media_type="audio/flac")
+        return _start(_separate, data, sr, mono, ctype="audio/flac")
+    return Response(await run_in_threadpool(_separate, data, sr, mono), media_type="audio/flac")
 
 
 @app.post("/dnr")
-async def dnr(request: Request, wait: int = 1, x_api_key: str = Header(None)):
+async def dnr(request: Request, wait: int = 1, up: str = "", n: int = 0, x_api_key: str = Header(None)):
     _auth(x_api_key)
-    data = await request.body()
+    data = _body(await request.body(), up, n)
     if not wait:
         return _start(_dnr_effects, data, ctype="audio/flac")
     return Response(await run_in_threadpool(_dnr_effects, data), media_type="audio/flac")
@@ -424,9 +471,9 @@ async def dnr(request: Request, wait: int = 1, x_api_key: str = Header(None)):
 
 @app.post("/whisper")
 async def whisper(request: Request, language: str = "zh", vad: int = 1, beam: int = 5, words: int = 1, wait: int = 1,
-                  x_api_key: str = Header(None)):
+                  up: str = "", n: int = 0, x_api_key: str = Header(None)):
     _auth(x_api_key)
-    data = await request.body()
+    data = _body(await request.body(), up, n)
     if not wait:
         return _start(_whisper, data, language, vad, beam, words)
     return await run_in_threadpool(_whisper, data, language, vad, beam, words)
