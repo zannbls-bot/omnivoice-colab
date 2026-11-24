@@ -14,6 +14,9 @@ POST /embed JSON {audios_b64: [...]} -> {"emb": [[...], ...]}   (WavLM speaker v
             dot product = cosine similarity; for picking same-speaker references and scoring clones)
 POST /judge JSON {audios_b64: [...], langs?} -> {"scores": [{"mos": 1-5, "lang": {"th": p, "zh": p, ...}}]}
             (UTMOS naturalness + Whisper language-ID: machine ears for picking the best take)
+POST /take  JSON /tts fields + language="th" -> {"sr", "audio_b64": FLAC of the take with Dub Studio's silence trim,
+            "text": /asr back-check of it, "emb": /embed vector of it, "ms": GPU time per step}
+            (one clone take in one request instead of three tunnel round trips)
 Heavy dub-pipeline jobs for Dub Studio (raw audio bytes in the request body, not JSON):
   add ?wait=0 to get {"job": id} at once, then GET /job/<id>: 202 = still running, 200 = the result, 404 = server
   restarted (submit again). Needed behind the Cloudflare tunnel, which cuts requests that take over 100 s (HTTP 524).
@@ -198,9 +201,13 @@ def tts(req: TTS, wait: int = 1, hold: int = 0, x_api_key: str = Header(None)):
     finally:
         for p in files:
             os.remove(p)
+    return Response(_wav16(wav, SR), media_type="audio/wav")
+
+
+def _wav16(y, sr):
     buf = io.BytesIO()
-    sf.write(buf, wav, SR, format="WAV", subtype="PCM_16")
-    return Response(buf.getvalue(), media_type="audio/wav")
+    sf.write(buf, y, sr, format="WAV", subtype="PCM_16")
+    return buf.getvalue()
 
 
 @app.post("/asr")
@@ -293,6 +300,70 @@ def embed(req: EMB, wait: int = 1, hold: int = 0, x_api_key: str = Header(None))
                 e = m(**x).embeddings[0]
             out.append(torch.nn.functional.normalize(e, dim=-1).tolist())
     return {"emb": out}
+
+
+def _trim(y, sr, db=-40.0, pad=0.05, gap=0.25, keep=0.15):
+    """Dub Studio V4's silence rule for clone takes (same code as its โคลนเสียง.ตัดเงียบ): cut head/tail silence but
+    keep pad s, shrink pauses inside the line longer than gap s to keep s. All silent = empty array."""
+    import numpy as np
+    hop = max(1, int(sr * 0.01))
+    n = len(y) // hop
+    if n == 0:
+        return y[:0]
+    rms = np.sqrt((y[:n * hop].reshape(n, hop) ** 2).mean(axis=1) + 1e-12)
+    on = rms > max(float(rms.max()) * 10 ** (db / 20), 3e-4)
+    if not on.any():
+        return y[:0]
+    a = max(0, int(np.argmax(on)) - int(pad * 100))
+    b = min(n, n - int(np.argmax(on[::-1])) + int(pad * 100))
+    keep_ = np.ones(n, bool)
+    k = a
+    while k < b:
+        if on[k]:
+            k += 1
+            continue
+        e = k
+        while e < b and not on[e]:
+            e += 1
+        if e < b and (e - k) * 0.01 > gap:
+            drop = (e - k) - int(keep * 100)
+            keep_[k + (e - k - drop) // 2: k + (e - k - drop) // 2 + drop] = False
+        k = e
+    idx = np.flatnonzero(keep_[a:b]) + a
+    return np.concatenate([y[i * hop:(i + 1) * hop] for i in idx]) if idx.size else y[:0]
+
+
+class TAKE(TTS):
+    language: str | None = "th"
+
+
+@app.post("/take")
+def take(req: TAKE, wait: int = 1, hold: int = 0, x_api_key: str = Header(None)):
+    """One clone take in one request: /tts, the silence trim, then /asr and /embed of the trimmed take. Dub Studio
+    used to make three requests per take, and the tunnel round trips cost more time than the GPU work. The steps
+    go through the same functions with the same 16-bit round trips, so the scores match the three-request way."""
+    _auth(x_api_key)
+    if not wait:
+        return _start(take, req, 1, 0, x_api_key, hold=hold)
+    import numpy as np
+    from scipy.signal import resample_poly
+    t = [time.time()]
+    y, sr = sf.read(io.BytesIO(tts(req, 1, 0, x_api_key).body), dtype="float32")
+    t.append(time.time())
+    y = _trim(y, sr)
+    out = {"sr": sr, "audio_b64": "", "text": "", "emb": None}
+    if len(y) >= 0.2 * sr:
+        out["text"] = asr(ASR(audio_b64=base64.b64encode(_wav16(y, sr)).decode(), language=req.language),
+                          1, 0, x_api_key)["text"]
+        t.append(time.time())
+        g = int(np.gcd(16000, sr))
+        y16 = resample_poly(y, 16000 // g, sr // g).astype(np.float32) if sr != 16000 else y
+        out["emb"] = embed(EMB(audios_b64=[base64.b64encode(_wav16(y16, 16000)).decode()]), 1, 0, x_api_key)["emb"][0]
+        t.append(time.time())
+    if len(y):
+        out["audio_b64"] = base64.b64encode(_flac(y, sr)).decode()
+    out["ms"] = dict(zip(("tts", "asr", "emb"), (int(1000 * (b - a)) for a, b in zip(t, t[1:]))))
+    return out
 
 
 # ---------------------------------------------------------------- dub-pipeline jobs (raw bytes in, raw bytes out)
