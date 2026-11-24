@@ -106,10 +106,26 @@ class _short_gpu:
             _short["last"] = time.time()
 
 
-def _long_gate():
-    """long jobs call this before taking gpu_lock"""
-    while _short["n"] or time.time() - _short["last"] < SHORT_GRACE:
+def _long_gate(low=False):
+    """long jobs call this before taking gpu_lock. low=True (effects) also waits while a separation or whisper job is
+    waiting or running: those feed the translation bot and the clone, the effects stem is only needed at the mix.
+    Dub Studio sends both at once (a 10-minute clip: 3 separation pieces and 6 effects windows of 60-90 s each)."""
+    while _short["n"] or time.time() - _short["last"] < SHORT_GRACE or (low and _mid["n"]):
         time.sleep(0.25)
+
+
+_mid = {"n": 0}               # separation / whisper jobs waiting or running
+_mid_guard = threading.Lock()
+
+
+class _mid_job:
+    def __enter__(self):
+        with _mid_guard:
+            _mid["n"] += 1
+
+    def __exit__(self, *exc):
+        with _mid_guard:
+            _mid["n"] -= 1
 
 
 _asr = []                     # lazily loaded Whisper pipeline
@@ -397,6 +413,11 @@ def _read(data, sr=None, mono=False):
 
 
 def _separate(data, sr=0, mono=0):
+    with _mid_job():
+        return _separate_now(data, sr, mono)
+
+
+def _separate_now(data, sr, mono):
     import glob
     import shutil
     _long_gate()
@@ -433,7 +454,7 @@ def _dnr_effects(data):
     mix = y.T                                   # (channels, samples)
     if mix.shape[0] == 1:
         mix = np.concatenate([mix, mix])
-    _long_gate()
+    _long_gate(low=True)
     with gpu_lock:
         if not _dnr:
             import sys
@@ -460,6 +481,11 @@ def _worker_answer(p):
 
 
 def _whisper(data, language, vad, beam, words):
+    with _mid_job():
+        return _whisper_now(data, language, vad, beam, words)
+
+
+def _whisper_now(data, language, vad, beam, words):
     import glob
     import site
     import subprocess
